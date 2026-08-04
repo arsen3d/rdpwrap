@@ -1,0 +1,65 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "hello-world.fullname" . }}
+  labels:
+    {{- include "hello-world.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "hello-world.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "hello-world.selectorLabels" . | nindent 8 }}
+      annotations:
+        # Roll the pod when the page content changes, which a ConfigMap edit
+        # alone would not do.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      containers:
+        - name: {{ .Chart.Name }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 80
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          volumeMounts:
+            - name: content
+              mountPath: /usr/share/nginx/html
+              readOnly: true
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: content
+          configMap:
+            name: {{ include "hello-world.fullname" . }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

@@ -1,0 +1,25 @@
+{{ .Values.message }} is deployed.
+
+Release:   {{ .Release.Name }}
+Namespace: {{ .Release.Namespace }}
+
+{{- if eq .Values.service.type "NodePort" }}
+
+The service is published on node port {{ .Values.service.nodePort }}. On a k3d
+cluster created with:
+
+    k3d cluster create <name> -p "8080:{{ .Values.service.nodePort }}@loadbalancer"
+
+it is reachable from the Windows host at:
+
+    http://localhost:8080
+
+If the page does not load, the cluster was most likely created without that port
+mapping. Port mappings are fixed when the cluster is created, so recreate it:
+
+    k3d cluster delete <name>
+{{- end }}
+
+Check the rollout with:
+
+    kubectl rollout status deployment/{{ include "hello-world.fullname" . }} -n {{ .Release.Namespace }}

@@ -444,45 +444,58 @@ function New-WorkerAccount {
     }
 }
 
-function Get-K3dPath {
-    $cmd = Get-Command k3d -ErrorAction SilentlyContinue
+function Get-ToolPath {
+    param([Parameter(Mandatory)][string] $Name)
+
+    $cmd = Get-Command $Name -ErrorAction SilentlyContinue
     if ($cmd) { return $cmd.Source }
+    # winget shims are not on this process's PATH straight after an install.
     foreach ($p in @(
-        (Join-Path $env:ProgramFiles 'WinGet\Links\k3d.exe'),
-        (Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Links\k3d.exe'))) {
+        (Join-Path $env:ProgramFiles "WinGet\Links\$Name.exe"),
+        (Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Links\$Name.exe"))) {
         if (Test-Path $p) { return $p }
     }
     return $null
 }
 
-function Install-K3dIfNeeded {
-    if (Get-K3dPath) {
-        Write-Ok "k3d already installed ($(Get-K3dPath))."
-        return
-    }
+function Install-WingetTool {
+    param(
+        [Parameter(Mandatory)][string] $Name,
+        [Parameter(Mandatory)][string] $Id,
+        [string] $ManualUrl
+    )
+
+    $existing = Get-ToolPath -Name $Name
+    if ($existing) { Write-Ok "$Name already installed ($existing)."; return }
+
     if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
-        throw 'winget is unavailable, so k3d cannot be installed automatically. See https://k3d.io for manual installation.'
+        throw "winget is unavailable, so $Name cannot be installed automatically. See $ManualUrl for manual installation."
     }
 
-    # Machine scope matters here: a user-scope install would land in the
-    # administrator's WinGet\Links directory and never appear on worker's PATH.
-    Write-Step "Installing k3d via winget (machine scope)..."
+    # Machine scope matters: a user-scope install lands in the administrator's
+    # WinGet\Links directory and never appears on the worker's PATH.
+    Write-Step "Installing $Name via winget (machine scope)..."
     $r = Invoke-NativeCapture {
-        winget install --id k3d.k3d --exact --scope machine --silent `
+        winget install --id $Id --exact --scope machine --silent `
             --accept-package-agreements --accept-source-agreements
     }
     $r.Output | Write-Host
     if ($r.ExitCode -ne 0) {
-        Write-Warn "Machine-scope install failed (exit $($r.ExitCode)); retrying with the default scope."
+        Write-Warn "Machine-scope install of $Name failed (exit $($r.ExitCode)); retrying with the default scope."
         $r = Invoke-NativeCapture {
-            winget install --id k3d.k3d --exact --silent `
+            winget install --id $Id --exact --silent `
                 --accept-package-agreements --accept-source-agreements
         }
         $r.Output | Write-Host
-        if ($r.ExitCode -ne 0) { throw "winget install k3d.k3d failed with exit code $($r.ExitCode)." }
-        Write-Warn "k3d was installed in user scope; confirm it is on '$WorkerUserName' PATH."
+        if ($r.ExitCode -ne 0) { throw "winget install $Id failed with exit code $($r.ExitCode)." }
+        Write-Warn "$Name was installed in user scope; confirm it is on '$WorkerUserName' PATH."
     }
-    Write-Ok "k3d installed."
+    Write-Ok "$Name installed."
+}
+
+function Install-K3sToolingIfNeeded {
+    Install-WingetTool -Name 'k3d'  -Id 'k3d.k3d'   -ManualUrl 'https://k3d.io'
+    Install-WingetTool -Name 'helm' -Id 'Helm.Helm' -ManualUrl 'https://helm.sh/docs/intro/install/'
 }
 
 function Register-DockerLogonTask {
@@ -685,9 +698,15 @@ function Invoke-Preflight {
 
     if ($EnsureK3s) {
         Write-Step "Checking k3s / k3d..."
-        $k3d = Get-K3dPath
-        if ($k3d) { Write-Ok "k3d present: $k3d" }
-        else { Write-Warn "k3d is not installed; Install will add it via winget (k3d.k3d)." }
+        foreach ($t in @(@{n='k3d'; id='k3d.k3d'}, @{n='helm'; id='Helm.Helm'})) {
+            $p = Get-ToolPath -Name $t.n
+            if ($p) { Write-Ok "$($t.n) present: $p" }
+            else { Write-Warn "$($t.n) is not installed; Install will add it via winget ($($t.id))." }
+        }
+
+        $chart = Join-Path (Split-Path $PSScriptRoot -Parent) 'charts\hello-world\Chart.yaml'
+        if (Test-Path $chart) { Write-Ok "Hello World chart present in this repository." }
+        else { Write-Warn "charts\hello-world is missing locally; the logon script downloads it from GitHub anyway." }
 
         if (-not (Test-Path (Join-Path $PSScriptRoot 'Start-WorkerStack.ps1'))) {
             $problems += 'Start-WorkerStack.ps1 is missing from the installer directory; the logon task cannot be registered without it.'
@@ -715,6 +734,7 @@ function Invoke-Preflight {
             Write-Ok "This account's Docker distro: $($ownDistro.BasePath -replace '^\\\\\?\\', '')"
         }
         Write-Ok "'$WorkerUserName' will get its own Docker distro and data disk on first launch (several GB, first logon is slow)."
+        Write-Ok "On logon the stack deploys the hello-world chart and opens http://localhost:8080 in that session."
     }
 
     if ($env:SESSIONNAME -and $env:SESSIONNAME -notlike 'Console*') {
@@ -736,7 +756,7 @@ function Invoke-Install {
     # WSL before Docker: Docker Desktop's default backend depends on it.
     if ($EnsureWSL)    { Install-WSLIfNeeded }
     if ($EnsureDocker) { Install-DockerIfNeeded }
-    if ($EnsureK3s)    { Install-K3dIfNeeded }
+    if ($EnsureK3s)    { Install-K3sToolingIfNeeded }
 
     $workerTaskRegistered = $false
     if ($CreateWorkerUser) {

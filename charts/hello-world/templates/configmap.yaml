@@ -1,0 +1,36 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "hello-world.fullname" . }}
+  labels:
+    {{- include "hello-world.labels" . | nindent 4 }}
+data:
+  index.html: |
+    <!doctype html>
+    <html lang="en">
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>{{ .Values.message }}</title>
+        <style>
+          :root { color-scheme: light dark; }
+          body {
+            margin: 0; min-height: 100vh;
+            display: flex; align-items: center; justify-content: center;
+            font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+            background: Canvas; color: CanvasText;
+          }
+          main { text-align: center; padding: 2rem; }
+          h1 { font-size: clamp(2rem, 8vw, 4rem); margin: 0 0 .5rem; }
+          p { opacity: .7; margin: .25rem 0; font-size: .95rem; }
+          code { font-family: ui-monospace, Consolas, monospace; }
+        </style>
+      </head>
+      <body>
+        <main>
+          <h1>{{ .Values.message }}</h1>
+          <p>Served from k3s in Docker on this machine.</p>
+          <p>release <code>{{ .Release.Name }}</code> &middot; namespace <code>{{ .Release.Namespace }}</code> &middot; chart <code>{{ include "hello-world.chart" . }}</code></p>
+        </main>
+      </body>
+    </html>

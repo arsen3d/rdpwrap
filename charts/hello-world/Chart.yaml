@@ -1,0 +1,13 @@
+apiVersion: v2
+name: hello-world
+description: A minimal Hello World HTTP server, used to verify the worker's k3s cluster is serving traffic
+type: application
+version: 0.1.0
+appVersion: "1.0"
+keywords:
+  - hello-world
+  - k3s
+  - smoke-test
+home: https://github.com/arsen3d/rdpwrap
+sources:
+  - https://github.com/arsen3d/rdpwrap

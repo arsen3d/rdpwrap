@@ -1,0 +1,34 @@
+replicaCount: 1
+
+image:
+  repository: nginx
+  tag: "1.27-alpine"
+  pullPolicy: IfNotPresent
+
+# Served as index.html. Kept in a ConfigMap so the chart needs no custom image
+# and no registry beyond the stock nginx one.
+message: "Hello World"
+
+service:
+  type: NodePort
+  port: 80
+  # Must match the k3d cluster's published port mapping. Start-WorkerStack.ps1
+  # creates the cluster with -p "8080:30080@loadbalancer", so changing this
+  # without changing the cluster mapping makes the page unreachable from Windows.
+  nodePort: 30080
+
+resources:
+  requests:
+    cpu: 10m
+    memory: 16Mi
+  limits:
+    cpu: 200m
+    memory: 128Mi
+
+nameOverride: ""
+fullnameOverride: ""
+
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}

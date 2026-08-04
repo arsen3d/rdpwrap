@@ -21,7 +21,17 @@
 param(
     [string] $ClusterName = 'worker',
     [int]    $DockerTimeoutSeconds = 300,
-    [string] $LogPath = (Join-Path $env:LOCALAPPDATA 'rdpwrap-worker-stack.log')
+    [string] $LogPath = (Join-Path $env:LOCALAPPDATA 'rdpwrap-worker-stack.log'),
+
+    # Hello World chart. Fetched from the repository archive rather than a Helm
+    # repository, so the chart lives with the code that deploys it.
+    [string] $ChartArchiveUrl = 'https://github.com/arsen3d/rdpwrap/archive/refs/heads/master.zip',
+    [string] $ChartSubPath    = 'charts/hello-world',
+    [string] $ReleaseName     = 'hello-world',
+    [int]    $HostPort        = 8080,
+    [int]    $NodePort        = 30080,
+    [switch] $SkipChart,
+    [switch] $NoBrowser
 )
 
 $ErrorActionPreference = 'Stop'
@@ -143,8 +153,12 @@ if ($exists) {
     $r = Invoke-NativeCapture { & $k3d cluster start $ClusterName }
 } else {
     # First run pulls the rancher/k3s image, so this can take several minutes.
-    Write-Log "Creating cluster '$ClusterName' (first run pulls the k3s image; this may take a while)..."
-    $r = Invoke-NativeCapture { & $k3d cluster create $ClusterName --wait }
+    # The port mapping has to be declared here: k3d fixes published ports when
+    # the cluster is created, and it cannot be added to a running cluster.
+    Write-Log "Creating cluster '$ClusterName' with $HostPort->$NodePort published (first run pulls the k3s image; this may take a while)..."
+    $r = Invoke-NativeCapture {
+        & $k3d cluster create $ClusterName -p "${HostPort}:${NodePort}@loadbalancer" --wait
+    }
 }
 $r.Output | ForEach-Object { Write-Log $_ }
 
@@ -157,6 +171,85 @@ $kubectl = Resolve-Tool -Name 'kubectl' -Fallbacks @(
 if ($kubectl) {
     $nodes = Invoke-NativeCapture { & $kubectl --context "k3d-$ClusterName" get nodes }
     $nodes.Output | ForEach-Object { Write-Log $_ }
+}
+
+if ($SkipChart) { Write-Log "Chart deployment skipped."; Write-Log "=== worker stack ready ==="; exit 0 }
+
+# ------------------------------------------------------------------ helm ----
+$helm = Resolve-Tool -Name 'helm' -Fallbacks @(
+    (Join-Path $env:ProgramFiles 'WinGet\Links\helm.exe'),
+    (Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Links\helm.exe')
+)
+if (-not $helm) { Write-Log "helm not found; re-run the installer with -EnsureK3s." 'ERROR'; exit 1 }
+
+# The chart is pulled straight from the GitHub repository archive. This keeps
+# one source of truth and needs no chart registry or gh-pages branch.
+$work = Join-Path $env:TEMP "rdpwrap-chart-$PID"
+$zip  = Join-Path $env:TEMP "rdpwrap-chart-$PID.zip"
+try {
+    Write-Log "Downloading chart from $ChartArchiveUrl ..."
+    $progress = $ProgressPreference
+    $ProgressPreference = 'SilentlyContinue'   # ~10x faster for Invoke-WebRequest
+    try {
+        Invoke-WebRequest -Uri $ChartArchiveUrl -OutFile $zip -UseBasicParsing
+    } finally {
+        $ProgressPreference = $progress
+    }
+
+    if (Test-Path $work) { Remove-Item $work -Recurse -Force }
+    Expand-Archive -Path $zip -DestinationPath $work -Force
+
+    # GitHub archives wrap everything in a <repo>-<ref> directory whose name
+    # depends on the branch, so discover it rather than hard-coding it.
+    $root = Get-ChildItem $work -Directory | Select-Object -First 1
+    if (-not $root) { throw "Downloaded archive contained no directory." }
+
+    $chartPath = Join-Path $root.FullName $ChartSubPath
+    if (-not (Test-Path (Join-Path $chartPath 'Chart.yaml'))) {
+        throw "No Chart.yaml under '$chartPath'."
+    }
+    Write-Log "Chart located at $chartPath"
+
+    Write-Log "Installing release '$ReleaseName'..."
+    $r = Invoke-NativeCapture {
+        & $helm upgrade --install $ReleaseName $chartPath `
+            --kube-context "k3d-$ClusterName" `
+            --set "service.nodePort=$NodePort" `
+            --wait --timeout 5m
+    }
+    $r.Output | ForEach-Object { Write-Log $_ }
+    if ($r.ExitCode -ne 0) { Write-Log "helm failed with exit code $($r.ExitCode)." 'ERROR'; exit 1 }
+    Write-Log "Release '$ReleaseName' installed."
+} finally {
+    Remove-Item $zip  -Force -ErrorAction SilentlyContinue
+    Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# --------------------------------------------------------------- browser ----
+$url = "http://localhost:$HostPort"
+Write-Log "Waiting for $url to serve..."
+$ready = $false
+for ($i = 0; $i -lt 30; $i++) {
+    try {
+        if ((Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 5).StatusCode -eq 200) {
+            $ready = $true
+            break
+        }
+    } catch { Start-Sleep -Seconds 2 }
+}
+
+if (-not $ready) {
+    Write-Log "$url did not respond. If the cluster predates this script it may lack the ${HostPort}:${NodePort} mapping; k3d cannot add one to an existing cluster, so recreate it with: k3d cluster delete $ClusterName" 'WARN'
+} else {
+    Write-Log "$url is serving."
+    if ($NoBrowser) {
+        Write-Log "Browser launch suppressed (-NoBrowser)."
+    } else {
+        # Runs inside the worker's interactive session, so this opens in their
+        # own desktop and their own default browser.
+        Write-Log "Opening $url in the default browser..."
+        Start-Process $url
+    }
 }
 
 Write-Log "=== worker stack ready ==="
