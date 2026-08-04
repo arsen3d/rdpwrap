@@ -63,6 +63,16 @@
 .PARAMETER K3sClusterName
     Name of the k3d cluster to create or start. Defaults to 'worker'.
 
+.PARAMETER EnableRemoteDesktop
+    Switch the Windows RDP host on: clear fDenyTSConnections, open 3389 and set
+    TermService to start automatically. Independent of the wrapper, so a machine
+    can accept a single RDP session without it. -Action Install always does this,
+    since the wrapper is pointless without it.
+
+.PARAMETER RdpFirewallProfile
+    Firewall profiles the 3389 rule applies to. Defaults to 'private,domain';
+    'any' also exposes the port on public networks.
+
 .PARAMETER AddDefenderExclusion
     Add a Defender path exclusion for the install directory. Several AV products,
     Defender included, quarantine rdpwrap.dll. Off by default: this weakens
@@ -93,6 +103,11 @@ param(
     [string] $WorkerPassword,
     [switch] $EnsureK3s,
     [string] $K3sClusterName = 'worker',
+    [switch] $EnableRemoteDesktop,
+    # Single-token values: a set member containing a comma makes PowerShell's
+    # own validation error unreadable.
+    [ValidateSet('PrivateDomain', 'Private', 'Domain', 'Any')]
+    [string] $RdpFirewallProfile = 'PrivateDomain',
     [switch] $AddDefenderExclusion,
     [switch] $Force
 )
@@ -657,6 +672,17 @@ function Invoke-Preflight {
         Write-Bad "rfxvmt.dll missing and no source supplied."
     }
 
+    Write-Step "Checking RDP host state..."
+    $deny = (Get-ItemProperty $TSKey -Name fDenyTSConnections -ErrorAction SilentlyContinue).fDenyTSConnections
+    $listening = [bool](Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue)
+    if ($deny -eq 0) { Write-Ok "Remote Desktop is enabled (fDenyTSConnections = 0); 3389 listening: $listening" }
+    else {
+        Write-Warn "Remote Desktop is disabled (fDenyTSConnections = $deny). Nothing can connect until it is enabled."
+        if ($Action -eq 'Provision' -and -not $EnableRemoteDesktop) {
+            Write-Warn "Pass -EnableRemoteDesktop to turn it on, or -Action Install to enable it with the wrapper."
+        }
+    }
+
     Write-Step "Checking TermService..."
     $svc = Get-Service TermService -ErrorAction SilentlyContinue
     if ($svc) {
@@ -810,6 +836,55 @@ function Invoke-Preflight {
 # Machine provisioning, deliberately separable from the wrapper: nothing here
 # touches Terminal Services, so it runs on a host still missing rfxvmt.dll or an
 # INI entry for its termsrv.dll build.
+# Turning on the RDP host is independent of the wrapper: stock Windows serves a
+# single session perfectly well, and the wrapper only adds concurrency. Keeping
+# it separate means a machine can be made reachable before rfxvmt.dll shows up.
+function Enable-RemoteDesktop {
+    $prior = @{
+        DenyConnections = (Get-ItemProperty $TSKey -Name fDenyTSConnections -ErrorAction SilentlyContinue).fDenyTSConnections
+        StartType       = (Get-Service TermService).StartType.ToString()
+    }
+
+    Write-Step "Enabling Remote Desktop connections..."
+    New-ItemProperty -Path $TSKey -Name fDenyTSConnections -PropertyType DWord -Value 0 -Force | Out-Null
+    Write-Ok "fDenyTSConnections = 0 (was $($prior.DenyConnections))"
+
+    # Default to private/domain rather than 'any'. A public-profile rule exposes
+    # 3389 on untrusted networks such as cafe or hotel Wi-Fi, which is a poor
+    # default for an account created for convenience.
+    $netshProfile = switch ($RdpFirewallProfile) {
+        'PrivateDomain' { 'private,domain' }
+        'Private'       { 'private' }
+        'Domain'        { 'domain' }
+        'Any'           { 'any' }
+    }
+
+    Write-Step "Adding firewall rules for profile '$netshProfile'..."
+    # Named distinctly so uninstall never removes Windows' built-in RDP rules.
+    netsh advfirewall firewall delete rule name="$FirewallRule" | Out-Null
+    foreach ($proto in 'tcp', 'udp') {
+        netsh advfirewall firewall add rule name="$FirewallRule" dir=in `
+            protocol=$proto localport=3389 profile=$netshProfile action=allow | Out-Null
+    }
+    Write-Ok "Firewall rules '$FirewallRule' added for TCP/UDP 3389 ($netshProfile)."
+    if ($RdpFirewallProfile -eq 'Any') {
+        Write-Warn "3389 is now reachable from public networks. With a weak account password this is a real exposure."
+    }
+
+    Write-Step "Starting TermService..."
+    Set-Service TermService -StartupType Automatic
+    if ((Get-Service TermService).Status -ne 'Running') { Start-Service TermService }
+
+    Start-Sleep -Seconds 2
+    if (Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue) {
+        Write-Ok "Port 3389 is listening."
+    } else {
+        Write-Warn "Port 3389 is not listening yet. A reboot is sometimes needed; check the Terminal Services event log."
+    }
+
+    return $prior
+}
+
 function Invoke-Provision {
     # WSL before Docker: Docker Desktop's default backend depends on it.
     if ($EnsureWSL)    { Install-WSLIfNeeded }
@@ -837,6 +912,8 @@ function Invoke-Install {
     $workerTaskRegistered = Invoke-Provision
 
     $svc = Get-Service TermService
+    $originalDeny  = (Get-ItemProperty $TSKey -Name fDenyTSConnections -ErrorAction SilentlyContinue).fDenyTSConnections
+    $originalStart = $svc.StartType.ToString()
     $originalDll  = (Get-ItemProperty $ParamsKey -Name ServiceDll -ErrorAction SilentlyContinue).ServiceDll
     # Anchor on the leading whitespace so this does not also match START_TYPE.
     $originalType = (sc.exe qc TermService |
@@ -865,6 +942,8 @@ function Invoke-Install {
     @{
         OriginalServiceDll  = $originalDll
         OriginalServiceType = $originalType
+        OriginalDenyTSConnections = $originalDeny
+        OriginalServiceStartType  = $originalStart
         InstalledRfxvmt     = $rfxInstalled
         EnsuredWSL          = [bool]$EnsureWSL
         EnsuredDocker       = [bool]$EnsureDocker
@@ -885,31 +964,16 @@ function Invoke-Install {
     sc.exe config TermService type= own | Out-Null
     Write-Ok "TermService type set to 'own' (was '$originalType')."
 
-    Write-Step "Enabling Remote Desktop connections..."
-    New-ItemProperty -Path $TSKey -Name fDenyTSConnections -PropertyType DWord -Value 0 -Force | Out-Null
-    Write-Ok "fDenyTSConnections = 0"
-
-    Write-Step "Adding firewall rules..."
-    # Named distinctly so uninstall never removes Windows' built-in RDP rules.
-    netsh advfirewall firewall delete rule name="$FirewallRule" | Out-Null
-    netsh advfirewall firewall add rule name="$FirewallRule" dir=in protocol=tcp localport=3389 profile=any action=allow | Out-Null
-    netsh advfirewall firewall add rule name="$FirewallRule" dir=in protocol=udp localport=3389 profile=any action=allow | Out-Null
-    Write-Ok "Firewall rules '$FirewallRule' added for TCP/UDP 3389."
-
     if ($AddDefenderExclusion) {
         Write-Step "Adding Defender exclusion for $InstallDir..."
         Add-MpPreference -ExclusionPath $InstallDir
         Write-Warn "Defender will no longer scan $InstallDir."
     }
 
-    Write-Step "Starting TermService..."
-    Set-Service TermService -StartupType Automatic
-    Start-Service TermService
-
-    Start-Sleep -Seconds 2
-    $listening = Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
-    if ($listening) { Write-Ok "Port 3389 is listening. Installation complete." }
-    else { Write-Warn "Port 3389 is not listening yet. Check the Terminal Services event log; a reboot is sometimes needed." }
+    # The wrapper is useless without the RDP host switched on, so Install always
+    # enables it regardless of the switch.
+    Enable-RemoteDesktop | Out-Null
+    Write-Ok "Installation complete."
 }
 
 function Invoke-Uninstall {
@@ -936,6 +1000,20 @@ function Invoke-Uninstall {
 
     Write-Step "Removing firewall rules..."
     netsh advfirewall firewall delete rule name="$FirewallRule" | Out-Null
+
+    # Put the RDP host back how it was found. A machine with RDP originally
+    # switched off should not be left listening after an uninstall.
+    if ($state -and $null -ne $state.OriginalDenyTSConnections) {
+        Write-Step "Restoring fDenyTSConnections..."
+        New-ItemProperty -Path $TSKey -Name fDenyTSConnections -PropertyType DWord `
+            -Value $state.OriginalDenyTSConnections -Force | Out-Null
+        Write-Ok "fDenyTSConnections = $($state.OriginalDenyTSConnections)"
+    }
+    if ($state -and $state.OriginalServiceStartType) {
+        Write-Step "Restoring TermService start type..."
+        Set-Service TermService -StartupType $state.OriginalServiceStartType
+        Write-Ok "TermService start type = $($state.OriginalServiceStartType)"
+    }
 
     if ($state -and $state.DefenderExclusion) {
         Write-Step "Removing Defender exclusion..."
@@ -1015,7 +1093,19 @@ switch ($Action) {
     'Check'     { Write-Host "Check-only run; nothing was modified." }
     'Provision' {
         Invoke-Provision | Out-Null
-        Write-Ok "Provisioning complete. Terminal Services was not modified."
+
+        if ($EnableRemoteDesktop) {
+            $prior = Enable-RemoteDesktop
+            Write-Host ""
+            # No state.json is written for a provision-only run, so revert
+            # instructions are printed rather than silently assumed.
+            Write-Warn "RDP was enabled without installing the wrapper, so only one session at a time is possible. To revert:"
+            Write-Host "        Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' fDenyTSConnections $($prior.DenyConnections)"
+            Write-Host "        Set-Service TermService -StartupType $($prior.StartType)"
+            Write-Host "        netsh advfirewall firewall delete rule name=`"$FirewallRule`""
+        } else {
+            Write-Ok "Terminal Services was not modified. Pass -EnableRemoteDesktop to switch the RDP host on."
+        }
         Write-Host ""
         Write-Host "A '$WorkerUserName' session appears only once that account signs in." -ForegroundColor Cyan
         Write-Host "The logon task then starts Docker, builds the k3s cluster and opens the page."
