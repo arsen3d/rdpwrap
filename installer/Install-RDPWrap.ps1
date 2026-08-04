@@ -80,7 +80,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Check', 'Install', 'Uninstall')]
+    [ValidateSet('Check', 'Provision', 'Install', 'Uninstall')]
     [string] $Action = 'Check',
     [string] $SourcePath,
     [string] $RfxvmtSource,
@@ -458,6 +458,25 @@ function Get-ToolPath {
     return $null
 }
 
+# A tool inside the running account's profile is invisible to every other
+# account, so "it is on my PATH" is the wrong question when provisioning for a
+# different user. Treat a user-scope copy as absent.
+function Get-MachineToolPath {
+    param([Parameter(Mandatory)][string] $Name)
+
+    # Probe the machine-wide location directly. Resolving through PATH first
+    # would find this account's own copy and mask an existing machine-wide
+    # install, producing a pointless reinstall on every run.
+    $machine = Join-Path $env:ProgramFiles "WinGet\Links\$Name.exe"
+    if (Test-Path $machine) { return $machine }
+
+    # Otherwise accept whatever PATH resolves to, as long as it is not inside
+    # this account's profile - the worker could not reach that.
+    $p = Get-ToolPath -Name $Name
+    if ($p -and $p -notlike "$env:USERPROFILE*") { return $p }
+    return $null
+}
+
 function Install-WingetTool {
     param(
         [Parameter(Mandatory)][string] $Name,
@@ -465,19 +484,29 @@ function Install-WingetTool {
         [string] $ManualUrl
     )
 
-    $existing = Get-ToolPath -Name $Name
-    if ($existing) { Write-Ok "$Name already installed ($existing)."; return }
+    $machine = Get-MachineToolPath -Name $Name
+    if ($machine) { Write-Ok "$Name already installed machine-wide ($machine)."; return }
+
+    $userCopy = Get-ToolPath -Name $Name
+    if ($userCopy) {
+        Write-Warn "$Name exists only in this account's profile ($userCopy); '$WorkerUserName' cannot see it. Installing machine-wide as well."
+    }
 
     if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
         throw "winget is unavailable, so $Name cannot be installed automatically. See $ManualUrl for manual installation."
     }
 
-    # Machine scope matters: a user-scope install lands in the administrator's
-    # WinGet\Links directory and never appears on the worker's PATH.
+    # --force is needed when a user-scope copy exists, or winget stops at
+    # "package already installed" and never performs the machine-wide install.
     Write-Step "Installing $Name via winget (machine scope)..."
     $r = Invoke-NativeCapture {
-        winget install --id $Id --exact --scope machine --silent `
-            --accept-package-agreements --accept-source-agreements
+        if ($userCopy) {
+            winget install --id $Id --exact --scope machine --silent --force `
+                --accept-package-agreements --accept-source-agreements
+        } else {
+            winget install --id $Id --exact --scope machine --silent `
+                --accept-package-agreements --accept-source-agreements
+        }
     }
     $r.Output | Write-Host
     if ($r.ExitCode -ne 0) {
@@ -534,7 +563,16 @@ function Register-DockerLogonTask {
 
     Register-ScheduledTask -TaskName $WorkerTaskName -Action $action -Trigger $trigger `
         -Principal $principal -Settings $settings -Force | Out-Null
-    Write-Ok "Logon task '$WorkerTaskName' registered."
+
+    # Confirm instead of assuming the absence of an exception means success.
+    if (-not (Get-ScheduledTask -TaskName $WorkerTaskName -ErrorAction SilentlyContinue)) {
+        throw "Register-ScheduledTask reported success but '$WorkerTaskName' cannot be read back."
+    }
+    Write-Ok "Logon task '$WorkerTaskName' registered and verified."
+    # Worth stating, because it looks like a failure otherwise: a task whose
+    # principal is another account is ACL'd to administrators and that account,
+    # so an unelevated session queries it as 'missing' even though it exists.
+    Write-Ok "Note: only administrators and '$WorkerUserName' can see this task; query it elevated."
     return $true
 }
 
@@ -542,12 +580,20 @@ function Register-DockerLogonTask {
 # Preflight
 # --------------------------------------------------------------------------
 function Invoke-Preflight {
-    $problems = @()
-    $osArch   = if ([Environment]::Is64BitOperatingSystem) { 'x64' } else { 'x86' }
+    # Two buckets, because -Action Provision touches none of Terminal Services:
+    # a missing rfxvmt.dll must not block installing Docker or creating the
+    # worker account.
+    $problems     = @()   # blocks Install
+    $provProblems = @()   # blocks Provision (and Install)
+    $osArch       = if ([Environment]::Is64BitOperatingSystem) { 'x64' } else { 'x86' }
 
     Write-Step "Checking privileges..."
     if (Test-Administrator) { Write-Ok "Running elevated." }
-    else { $problems += 'Not running as Administrator. Re-launch PowerShell elevated.'; Write-Bad "Not elevated." }
+    else {
+        $problems     += 'Not running as Administrator. Re-launch PowerShell elevated.'
+        $provProblems += 'Not running as Administrator. Re-launch PowerShell elevated.'
+        Write-Bad "Not elevated."
+    }
 
     Write-Step "Checking Windows version..."
     $osVer  = [Environment]::OSVersion.Version
@@ -639,7 +685,7 @@ function Invoke-Preflight {
         if ($wsl.VirtualizationOk) {
             Write-Ok "Hardware virtualization available (HypervisorPresent = $($wsl.HypervisorPresent))."
         } else {
-            $problems += 'Hardware virtualization is unavailable. Enable Intel VT-x / AMD-V in firmware before WSL 2 can run.'
+            $provProblems += 'Hardware virtualization is unavailable. Enable Intel VT-x / AMD-V in firmware before WSL 2 can run.'
             Write-Bad "Hardware virtualization unavailable."
         }
 
@@ -698,10 +744,18 @@ function Invoke-Preflight {
 
     if ($EnsureK3s) {
         Write-Step "Checking k3s / k3d..."
+        # Report scope, not mere presence: a copy inside this account's profile
+        # is invisible to the worker and is what the logon script would fail on.
         foreach ($t in @(@{n='k3d'; id='k3d.k3d'}, @{n='helm'; id='Helm.Helm'})) {
-            $p = Get-ToolPath -Name $t.n
-            if ($p) { Write-Ok "$($t.n) present: $p" }
-            else { Write-Warn "$($t.n) is not installed; Install will add it via winget ($($t.id))." }
+            $machine = Get-MachineToolPath -Name $t.n
+            $any     = Get-ToolPath -Name $t.n
+            if ($machine) {
+                Write-Ok "$($t.n) present machine-wide: $machine"
+            } elseif ($any) {
+                Write-Warn "$($t.n) exists only in this account's profile ($any); '$WorkerUserName' cannot see it. Install will add it machine-wide."
+            } else {
+                Write-Warn "$($t.n) is not installed; Install will add it via winget ($($t.id))."
+            }
         }
 
         $chart = Join-Path (Split-Path $PSScriptRoot -Parent) 'charts\hello-world\Chart.yaml'
@@ -709,7 +763,7 @@ function Invoke-Preflight {
         else { Write-Warn "charts\hello-world is missing locally; the logon script downloads it from GitHub anyway." }
 
         if (-not (Test-Path (Join-Path $PSScriptRoot 'Start-WorkerStack.ps1'))) {
-            $problems += 'Start-WorkerStack.ps1 is missing from the installer directory; the logon task cannot be registered without it.'
+            $provProblems += 'Start-WorkerStack.ps1 is missing from the installer directory; the logon task cannot be registered without it.'
             Write-Bad "Start-WorkerStack.ps1 not found."
         } else {
             Write-Ok "Worker logon script found."
@@ -742,23 +796,27 @@ function Invoke-Preflight {
         if (-not $Force) { $problems += 'Refusing to restart TermService from a remote session without -Force.' }
     }
 
-    [pscustomobject]@{ Problems = $problems; SourcePath = $SourcePath; TermsrvVersion = $tsVer }
+    [pscustomobject]@{
+        Problems     = $problems
+        ProvProblems = $provProblems
+        SourcePath   = $SourcePath
+        TermsrvVersion = $tsVer
+    }
 }
 
 # --------------------------------------------------------------------------
 # Install / Uninstall
 # --------------------------------------------------------------------------
-function Invoke-Install {
-    param($Pre)
-
-    # Done first: it is independent of the wrapper, and may want a reboot that
-    # is better surfaced before TermService is touched.
+# Machine provisioning, deliberately separable from the wrapper: nothing here
+# touches Terminal Services, so it runs on a host still missing rfxvmt.dll or an
+# INI entry for its termsrv.dll build.
+function Invoke-Provision {
     # WSL before Docker: Docker Desktop's default backend depends on it.
     if ($EnsureWSL)    { Install-WSLIfNeeded }
     if ($EnsureDocker) { Install-DockerIfNeeded }
     if ($EnsureK3s)    { Install-K3sToolingIfNeeded }
 
-    $workerTaskRegistered = $false
+    $registered = $false
     if ($CreateWorkerUser) {
         $secure = if ($WorkerPassword) {
             ConvertTo-SecureString $WorkerPassword -AsPlainText -Force
@@ -766,8 +824,17 @@ function Invoke-Install {
             Read-Host -Prompt "Password for '$WorkerUserName'" -AsSecureString
         }
         New-WorkerAccount -Password $secure
-        $workerTaskRegistered = Register-DockerLogonTask
+        $registered = Register-DockerLogonTask
     }
+    return $registered
+}
+
+function Invoke-Install {
+    param($Pre)
+
+    # Done first: it is independent of the wrapper, and may want a reboot that
+    # is better surfaced before TermService is touched.
+    $workerTaskRegistered = Invoke-Provision
 
     $svc = Get-Service TermService
     $originalDll  = (Get-ItemProperty $ParamsKey -Name ServiceDll -ErrorAction SilentlyContinue).ServiceDll
@@ -922,12 +989,22 @@ Write-Host "-----------------------------------------"
 $pre = Invoke-Preflight
 Write-Host ""
 
+# Provision is judged only against problems that would actually stop it; the
+# wrapper's blockers are reported but not treated as fatal for that action.
+$blocking = if ($Action -eq 'Provision') { @($pre.ProvProblems) } else { @($pre.Problems) }
+
 if ($pre.Problems.Count -gt 0) {
     Write-Bad "Preflight found $($pre.Problems.Count) problem(s):"
-    $pre.Problems | ForEach-Object { Write-Host "    - $_" -ForegroundColor Red }
+    $pre.Problems | ForEach-Object {
+        $fatal = $blocking -contains $_
+        Write-Host "    - $_" -ForegroundColor $(if ($fatal) { 'Red' } else { 'DarkYellow' })
+    }
+    if ($Action -eq 'Provision' -and $blocking.Count -lt $pre.Problems.Count) {
+        Write-Warn "Items in yellow affect the RDP wrapper only and do not block provisioning."
+    }
     Write-Host ""
-    if ($Action -eq 'Install' -and -not $Force) {
-        throw "Refusing to install. Resolve the problems above, or re-run with -Force to override."
+    if ($blocking.Count -gt 0 -and $Action -in @('Install', 'Provision') -and -not $Force) {
+        throw "Refusing to $($Action.ToLower()). Resolve the problems above, or re-run with -Force to override."
     }
 } else {
     Write-Ok "All dependency checks passed."
@@ -936,6 +1013,13 @@ if ($pre.Problems.Count -gt 0) {
 
 switch ($Action) {
     'Check'     { Write-Host "Check-only run; nothing was modified." }
+    'Provision' {
+        Invoke-Provision | Out-Null
+        Write-Ok "Provisioning complete. Terminal Services was not modified."
+        Write-Host ""
+        Write-Host "A '$WorkerUserName' session appears only once that account signs in." -ForegroundColor Cyan
+        Write-Host "The logon task then starts Docker, builds the k3s cluster and opens the page."
+    }
     'Install'   { Invoke-Install -Pre $pre }
     'Uninstall' { Invoke-Uninstall }
 }
