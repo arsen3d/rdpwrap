@@ -73,6 +73,20 @@
     Firewall profiles the 3389 rule applies to. Defaults to 'private,domain';
     'any' also exposes the port on public networks.
 
+.PARAMETER AutoLogonWorker
+    Configure Winlogon to sign the worker in automatically at the next boot, so
+    the whole stack comes up without anyone at the keyboard. One-shot: the logon
+    count is set to 1, and a SYSTEM task scrubs the stored secret at the next
+    logon and then removes itself.
+
+    This writes the password to HKLM in clear text until that scrub runs. Any
+    administrator or anyone with offline disk access can read it in the
+    meantime. Use a throwaway password for this account.
+
+.PARAMETER RebootWhenDone
+    Reboot immediately once provisioning finishes. Without it the script only
+    prints the command, since rebooting is not something to do by surprise.
+
 .PARAMETER AddDefenderExclusion
     Add a Defender path exclusion for the install directory. Several AV products,
     Defender included, quarantine rdpwrap.dll. Off by default: this weakens
@@ -103,6 +117,8 @@ param(
     [string] $WorkerPassword,
     [switch] $EnsureK3s,
     [string] $K3sClusterName = 'worker',
+    [switch] $AutoLogonWorker,
+    [switch] $RebootWhenDone,
     [switch] $EnableRemoteDesktop,
     # Single-token values: a set member containing a comma makes PowerShell's
     # own validation error unreadable.
@@ -760,6 +776,19 @@ function Invoke-Preflight {
         $minLen = (net accounts | Select-String 'Minimum password length' | ForEach-Object { ($_ -split ':')[1].Trim() })
         Write-Ok "Local minimum password length: $minLen"
 
+        if ($AutoLogonWorker) {
+            # Winlogon reads DefaultPassword as a literal string; there is no way
+            # to arm an unattended logon from a SecureString prompt.
+            if (-not $WorkerPassword) {
+                $provProblems += '-AutoLogonWorker requires -WorkerPassword: Winlogon stores the password as clear text and cannot take it from a prompt.'
+                Write-Bad "-AutoLogonWorker given without -WorkerPassword."
+            } else {
+                Write-Warn "Auto-logon will write '$WorkerUserName' credentials to HKLM in clear text until the scrub task runs at next logon."
+            }
+            if ($RebootWhenDone) { Write-Warn "This run will REBOOT the machine when it finishes." }
+            else { Write-Ok "Auto-logon will be armed; reboot yourself when ready (-RebootWhenDone to do it automatically)." }
+        }
+
         if (Get-DockerDesktopExe) { Write-Ok "Docker Desktop executable found for the logon task." }
         else { Write-Warn "Docker Desktop is not installed, so the logon task cannot be created. Add -EnsureDocker." }
 
@@ -885,6 +914,92 @@ function Enable-RemoteDesktop {
     return $prior
 }
 
+# Winlogon auto-logon.
+#
+# Docker Desktop runs its engine from a per-user tray application, so the stack
+# needs a real interactive desktop for the worker. Windows offers no way to
+# conjure one for another account on demand: a session is created by the
+# credential provider (someone at the keyboard), by an incoming RDP connection,
+# or by Winlogon at boot. With loopback RDP unavailable until the wrapper is
+# installed, boot-time auto-logon is the only unattended route.
+$AutoLogonScrubTask = 'RDPWrap - Clear autologon secret'
+
+function Enable-WorkerAutoLogon {
+    param([Parameter(Mandatory)][string] $PlainPassword)
+
+    $key = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+
+    $prior = @{
+        AutoAdminLogon    = (Get-ItemProperty $key -Name AutoAdminLogon    -ErrorAction SilentlyContinue).AutoAdminLogon
+        DefaultUserName   = (Get-ItemProperty $key -Name DefaultUserName   -ErrorAction SilentlyContinue).DefaultUserName
+        DefaultDomainName = (Get-ItemProperty $key -Name DefaultDomainName -ErrorAction SilentlyContinue).DefaultDomainName
+    }
+
+    Write-Step "Configuring one-shot auto-logon for '$WorkerUserName'..."
+    Set-ItemProperty $key -Name AutoAdminLogon    -Value '1'              -Type String
+    Set-ItemProperty $key -Name DefaultUserName   -Value $WorkerUserName  -Type String
+    Set-ItemProperty $key -Name DefaultDomainName -Value $env:COMPUTERNAME -Type String
+    Set-ItemProperty $key -Name DefaultPassword   -Value $PlainPassword   -Type String
+    # Winlogon decrements this each time and stops auto-logging on at zero, so a
+    # single unattended boot cannot turn into a permanently passwordless machine.
+    Set-ItemProperty $key -Name AutoLogonCount    -Value 1                -Type DWord
+
+    Write-Ok "Auto-logon set for '$WorkerUserName' on the next boot only."
+    Write-Warn "The password is in HKLM in clear text until the scrub task runs."
+
+    # Defence in depth: AutoLogonCount handling has varied across Windows
+    # versions, so do not rely on it to remove the secret.
+    Write-Step "Registering SYSTEM task to scrub the stored secret..."
+    $scrub = @"
+`$k = '$key'
+foreach (`$v in 'DefaultPassword','AutoAdminLogon','AutoLogonCount') {
+    Remove-ItemProperty -Path `$k -Name `$v -ErrorAction SilentlyContinue
+}
+Unregister-ScheduledTask -TaskName '$AutoLogonScrubTask' -Confirm:`$false -ErrorAction SilentlyContinue
+"@
+    $scrubFile = Join-Path $InstallDir 'Clear-AutoLogon.ps1'
+    New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+    Set-Content -Path $scrubFile -Value $scrub -Encoding utf8
+
+    $action    = New-ScheduledTaskAction -Execute 'powershell.exe' `
+                    -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scrubFile`""
+    $trigger   = New-ScheduledTaskTrigger -AtLogOn
+    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    Register-ScheduledTask -TaskName $AutoLogonScrubTask -Action $action -Trigger $trigger `
+        -Principal $principal -Force | Out-Null
+
+    if (-not (Get-ScheduledTask -TaskName $AutoLogonScrubTask -ErrorAction SilentlyContinue)) {
+        throw "Scrub task '$AutoLogonScrubTask' could not be read back; refusing to leave a password in HKLM without cleanup."
+    }
+    Write-Ok "Scrub task registered and verified; it removes the secret at the next logon."
+
+    return $prior
+}
+
+# Shared tail for Provision and Install: arm the unattended logon and, only if
+# explicitly asked, reboot into it.
+function Complete-UnattendedLogon {
+    if (-not $AutoLogonWorker) { return }
+
+    Enable-WorkerAutoLogon -PlainPassword $WorkerPassword | Out-Null
+
+    Write-Host ""
+    Write-Host "Next boot signs in as '$WorkerUserName' automatically and the logon task runs:" -ForegroundColor Cyan
+    Write-Host "  Docker Desktop -> engine -> k3d cluster '$K3sClusterName' -> helm install -> browser"
+    Write-Host "First run is slow: a fresh Docker data disk for that account, then the k3s and nginx pulls."
+    Write-Host "Progress: C:\Users\$WorkerUserName\AppData\Local\rdpwrap-worker-stack.log"
+    Write-Host ""
+
+    if ($RebootWhenDone) {
+        Write-Warn "Rebooting in 15 seconds. Ctrl+C to abort."
+        Start-Sleep -Seconds 15
+        Restart-Computer -Force
+    } else {
+        Write-Warn "Not rebooting. Auto-logon is armed for the next boot; restart when ready:"
+        Write-Host "        Restart-Computer -Force"
+    }
+}
+
 function Invoke-Provision {
     # WSL before Docker: Docker Desktop's default backend depends on it.
     if ($EnsureWSL)    { Install-WSLIfNeeded }
@@ -974,6 +1089,8 @@ function Invoke-Install {
     # enables it regardless of the switch.
     Enable-RemoteDesktop | Out-Null
     Write-Ok "Installation complete."
+
+    Complete-UnattendedLogon
 }
 
 function Invoke-Uninstall {
@@ -997,6 +1114,16 @@ function Invoke-Uninstall {
     $typeArg = if ($restoreType -match 'SHARE') { 'share' } else { 'own' }
     sc.exe config TermService type= $typeArg | Out-Null
     Write-Ok "TermService type = $typeArg"
+
+    # Unconditional: an armed auto-logon left behind after an uninstall would
+    # silently sign the machine in as the worker on the next boot.
+    Write-Step "Clearing any armed auto-logon..."
+    $wl = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+    foreach ($v in 'DefaultPassword', 'AutoAdminLogon', 'AutoLogonCount') {
+        Remove-ItemProperty -Path $wl -Name $v -ErrorAction SilentlyContinue
+    }
+    Unregister-ScheduledTask -TaskName $AutoLogonScrubTask -Confirm:$false -ErrorAction SilentlyContinue
+    Write-Ok "Auto-logon values and scrub task removed."
 
     Write-Step "Removing firewall rules..."
     netsh advfirewall firewall delete rule name="$FirewallRule" | Out-Null
@@ -1106,6 +1233,8 @@ switch ($Action) {
         } else {
             Write-Ok "Terminal Services was not modified. Pass -EnableRemoteDesktop to switch the RDP host on."
         }
+
+        Complete-UnattendedLogon
         Write-Host ""
         Write-Host "A '$WorkerUserName' session appears only once that account signs in." -ForegroundColor Cyan
         Write-Host "The logon task then starts Docker, builds the k3s cluster and opens the page."

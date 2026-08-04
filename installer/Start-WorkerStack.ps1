@@ -30,6 +30,7 @@ param(
     [string] $ReleaseName     = 'hello-world',
     [int]    $HostPort        = 8080,
     [int]    $NodePort        = 30080,
+    [int]    $ApiPort         = 6445,
     [switch] $SkipChart,
     [switch] $NoBrowser
 )
@@ -156,8 +157,13 @@ if ($exists) {
     # The port mapping has to be declared here: k3d fixes published ports when
     # the cluster is created, and it cannot be added to a running cluster.
     Write-Log "Creating cluster '$ClusterName' with $HostPort->$NodePort published (first run pulls the k3s image; this may take a while)..."
+    # --api-port is required, not optional: without it k3d leaves 6443 exposed
+    # but unpublished and writes a kubeconfig pointing at host.docker.internal
+    # on a port nothing ever bound, so every kubectl and helm call times out.
     $r = Invoke-NativeCapture {
-        & $k3d cluster create $ClusterName -p "${HostPort}:${NodePort}@loadbalancer" --wait
+        & $k3d cluster create $ClusterName `
+            --api-port "127.0.0.1:$ApiPort" `
+            -p "${HostPort}:${NodePort}@loadbalancer" --wait
     }
 }
 $r.Output | ForEach-Object { Write-Log $_ }
@@ -226,7 +232,10 @@ try {
 }
 
 # --------------------------------------------------------------- browser ----
-$url = "http://localhost:$HostPort"
+# 127.0.0.1, not localhost: 'localhost' resolves to ::1 first on Windows, and
+# Docker Desktop's IPv6 publication does not carry traffic, so the request hangs
+# until it times out even though the service is serving perfectly on IPv4.
+$url = "http://127.0.0.1:$HostPort"
 Write-Log "Waiting for $url to serve..."
 $ready = $false
 for ($i = 0; $i -lt 30; $i++) {
